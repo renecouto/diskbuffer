@@ -9,7 +9,7 @@ Imagine you have a very slow sink and a fast source, and you are billed per hour
 - Save to memory buffer before flushing to disk
 - futures::streams interop
 - Configurable buffer sizes
-- Rolling files to avoid leaking storage
+- Rolling files to avoid leaking storage DONE
 - Save in a fast format(avro, protobuf, thrift)
     - How to delimit records?
     - Use a custom reader?
