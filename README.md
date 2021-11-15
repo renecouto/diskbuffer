@@ -7,6 +7,8 @@ Imagine you have a very slow sink and a fast source, and you are billed per hour
     - correct ordering
     - Accept any rust serde type
 - Save to memory buffer before flushing to disk
+    - DONE on the read size
+- Tests
 - futures::streams interop
 - Configurable buffer sizes
 - Rolling files to avoid leaking storage DONE

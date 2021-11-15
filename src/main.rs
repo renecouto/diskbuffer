@@ -1,7 +1,7 @@
 use std::convert::TryInto;
 use std::marker::PhantomData;
 
-use futures::Stream;
+use std::io::Cursor;
 use std::io::Result;
 use tokio::fs::File;
 use tokio::fs::OpenOptions;
@@ -9,13 +9,14 @@ use tokio::io::AsyncSeekExt;
 use tokio::{self, io::AsyncBufReadExt, io::AsyncReadExt};
 
 use serde::{de::DeserializeOwned, ser, Deserialize, Serialize};
+use std::fmt::Debug;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct X {
     pub a: String,
 }
 
-struct DiskBuffer<T: ser::Serialize + DeserializeOwned> {
+struct DiskBuffer<T: ser::Serialize + DeserializeOwned + Clone + Debug> {
     writer: File,
     writer_file_size: u64,
     writer_file_name: String,
@@ -28,6 +29,7 @@ struct DiskBuffer<T: ser::Serialize + DeserializeOwned> {
     file_path: String,
     reader_file_idx: u64,
     writer_file_idx: u64,
+    read_buffer: Vec<T>,
 }
 
 async fn new_writer(file_path: &str) -> File {
@@ -41,15 +43,46 @@ async fn new_writer(file_path: &str) -> File {
 }
 async fn new_reader(file_path: &str) -> File {
     OpenOptions::new()
-        // .append(true)
-        // .create(true)
         .read(true)
         .open(file_path)
         .await
         .unwrap()
 }
 
-impl<T: ser::Serialize + DeserializeOwned> DiskBuffer<T> {
+async fn read_lines_nl_ended(reader: &mut File) -> Result<Vec<String>> {
+    use bytes::BytesMut;
+    use std::io::SeekFrom;
+    let pos = reader.stream_position().await?;
+    let mut lines_to_ret:Vec<String> = vec![];
+    let mut res: BytesMut = BytesMut::with_capacity(1024);
+    let read = reader.read_buf(&mut res).await?;
+    let mut cursor = Cursor::new(res);
+    // let mut total_bytes_read = 0;
+    let mut bytes_read_back = 0;
+    loop {
+        let mut to_parse = String::new();
+        let bytes_read = cursor.read_line(&mut to_parse).await?;
+        println!("read: {}", &to_parse);
+        if to_parse.ends_with('\n') {
+            // total_bytes_read += bytes_read;
+            lines_to_ret.push(to_parse);
+        } else {
+            bytes_read_back += bytes_read;
+        }
+        if bytes_read == 0 {
+            break;
+        }
+    }
+    let relative_position: i64 = bytes_read_back.try_into().unwrap();
+    reader
+                .seek(SeekFrom::Current(- relative_position))
+                .await
+                .unwrap();
+    
+    Ok(lines_to_ret)
+}
+
+impl<T: ser::Serialize + DeserializeOwned + Clone + Debug> DiskBuffer<T> {
     pub async fn new(file_path: &str, file_size: u64) -> DiskBuffer<T> {
         let first_file_path = format!("{}{}", file_path, "0");
         let writer = new_writer(&first_file_path).await;
@@ -66,44 +99,51 @@ impl<T: ser::Serialize + DeserializeOwned> DiskBuffer<T> {
             completed_files: vec![],
             reader_file_idx: 0,
             writer_file_idx: 0,
+            read_buffer: vec![],
         }
     }
 
     pub async fn read_one(&mut self) -> Result<Option<T>> {
+        
+
         use bytes::BytesMut;
         use std::io::SeekFrom;
-        let mut res: BytesMut = BytesMut::with_capacity(600);
-        let read = self.reader.read_buf(&mut res).await?;
-        //FIXME make it simpler
-        if read > 0 {
-            let mut cursor = Cursor::new(res);
-            let mut to_parse = String::new();
-            cursor.read_line(&mut to_parse).await?;
-            let parsed_lines: i64 = to_parse.as_bytes().len().try_into().unwrap();
-            let ress: T = serde_json::from_str(to_parse.as_str())?;
-            let pos: i64 = usize::try_into(read).expect("invalid number");
-            self.reader
-                .seek(SeekFrom::Current(parsed_lines - pos))
-                .await
-                .unwrap();
-            
-            let pos = self.reader.stream_position().await?;
-            if let Some((name, size)) = self.completed_files.first() {
-                if *name == self.reader_file_name && *size == pos {
-                    self.reader_file_idx += 1;
-                    let new_file_path = format!("{}{}", &self.file_path, &self.reader_file_idx);
-                    println!("rolling to new file! on reader {}", &new_file_path);
-                    self.reader = new_reader(&new_file_path).await;
-                    self.reader_file_name = new_file_path;
-                    tokio::fs::remove_file(name).await?;
-                    self.completed_files = self.completed_files.as_slice()[1..].into(); // haha now this is a deque
-                }
-            }
-            Ok(Some(ress))
-        } else {
-            
-            Ok(None)
+        if self.read_buffer.len() > 0 {
+            println!("returning from buffer");
+            let to_ret = self.read_buffer[0].clone();
+            self.read_buffer = self.read_buffer.as_mut_slice()[1..].into();
+            return Ok(Some(to_ret))
         }
+        let mut to_ret = None;
+        let mut to_buffer: Vec<T> = vec![];
+        let mut lines: Vec<T> =  vec![];
+        for i in read_lines_nl_ended(&mut self.reader).await? {
+            lines.push(serde_json::from_str(&i)?);
+        } 
+        if lines.len() == 0 {
+            return Ok(None)
+        } else {
+            if lines.len() > 0 {
+                to_ret = Some(lines[0].clone());
+                to_buffer = lines.as_mut_slice()[1..].into();
+            }
+        }
+        println!("to buffer: {:?}", &to_buffer);
+        self.read_buffer = to_buffer;
+        let pos = self.reader.stream_position().await?;
+    
+        if let Some((name, size)) = self.completed_files.first() {
+            if *name == self.reader_file_name && *size == pos {
+                self.reader_file_idx += 1;
+                let new_file_path = format!("{}{}", &self.file_path, &self.reader_file_idx);
+                println!("rolling to new file! on reader {}", &new_file_path);
+                self.reader = new_reader(&new_file_path).await;
+                self.reader_file_name = new_file_path;
+                tokio::fs::remove_file(name).await?;
+                self.completed_files = self.completed_files.as_mut_slice()[1..].into(); // haha now this is a deque
+            }
+        }
+        Ok(to_ret)
     }
 
     pub async fn write_one(&mut self, obj: &T) -> Result<()> {
@@ -132,11 +172,11 @@ impl<T: ser::Serialize + DeserializeOwned> DiskBuffer<T> {
         Ok(())
     }
 }
-use std::io::Cursor;
+
 
 #[tokio::main]
 async fn main() {
-    let mut db: DiskBuffer<X> = DiskBuffer::new("qwe.jsonl", 24).await;
+    let mut db: DiskBuffer<X> = DiskBuffer::new("qwe.jsonl", 600).await;
     println!("initiated");
     db.write_one(&X { a: "123".into() }).await;
     println!("wrote one item");
@@ -145,6 +185,13 @@ async fn main() {
     let res1 = db.read_one().await;
     println!("{:?}", res1);
     db.write_one(&X { a: "789".into() }).await;
+    println!("wrote third item");
+    db.write_one(&X { a: "101112".into() }).await;
+    println!("wrote third item");
+    db.write_one(&X { a: "131415".into() }).await;
+    println!("wrote third item");
+    db.write_one(&X { a: "161718".into() }).await;
+    println!("wrote third item");
     let res1 = db.read_one().await;
     println!("{:?}", res1);
     let res1 = db.read_one().await;
